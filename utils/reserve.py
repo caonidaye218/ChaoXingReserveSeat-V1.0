@@ -1,4 +1,4 @@
-from .encrypt import AES_Encrypt, enc, generate_captcha_key
+from .encrypt import AES_Encrypt, enc, generate_captcha_key, generate_behavior_analysis, generate_realistic_behavior_analysis
 import json
 import requests
 import re
@@ -24,20 +24,39 @@ class reserve:
         self.token = ""
         self.requests = requests.session()
         
-        # 修改后的cookies设置 - 移除了JSESSIONID
+        # 修改后的cookies设置
         self.requests.cookies.update({
             'route': ''.join(random.choices('abcdef0123456789', k=32)),
             '_uid': str(random.randint(10000000, 99999999))
-           })
+        })
         
         # 增强token提取模式
         self.token_patterns = [
-            re.compile("token\s*=\s*['\"](.*?)['\"]"),  # 原始模式
-            re.compile("token\s*:\s*['\"](.*?)['\"]"),  # JS变量模式
-            re.compile('<meta\s+name="token"\s+content="(.*?)"')  # meta标签模式
+            re.compile("token\s*=\s*['\"](.*?)['\"]"),
+            re.compile("token\s*:\s*['\"](.*?)['\"]"),
+            re.compile('<meta\s+name="token"\s+content="(.*?)"'),
+            re.compile('window\.token\s*=\s*["\']([^"\']+)["\']'),
+            re.compile('var\s+token\s*=\s*["\']([^"\']+)["\']'),
+            re.compile('name=["\']_token["\'][^>]*value=["\']([^"\']+)["\']'),
+            re.compile('value=["\']([^"\']+)["\'][^>]*name=["\']_token["\']')
         ]
         
-        # 请求头设置 - 添加更多浏览器特征
+        # 行为分析数据提取模式
+        self.behavior_patterns = [
+            re.compile(r'behaviorAnalysis["\']?\s*[:=]\s*["\']([^"\']+)["\']'),
+            re.compile(r'data-behavior["\']?\s*[:=]\s*["\']([^"\']+)["\']'),
+            re.compile(r'window\.behaviorAnalysis\s*=\s*["\']([^"\']+)["\']'),
+            re.compile(r'name=["\']behaviorAnalysis["\'][^>]*value=["\']([^"\']+)["\']')
+        ]
+        
+        # deptIdEnc提取模式
+        self.dept_patterns = [
+            re.compile(r'deptIdEnc["\']?\s*[:=]\s*["\']([^"\']+)["\']'),
+            re.compile(r'data-dept["\']?\s*[:=]\s*["\']([^"\']+)["\']'),
+            re.compile(r'name=["\']deptIdEnc["\'][^>]*value=["\']([^"\']+)["\']')
+        ]
+        
+        # 请求头设置
         self.headers = {
             "Referer": "https://office.chaoxing.com/",
             "Host": "captcha.chaoxing.com",
@@ -67,35 +86,61 @@ class reserve:
         self.beijing_tz = pytz.timezone('Asia/Shanghai')
         self.requests.headers.update(self.login_headers)
         
-        # 缓存验证码结果
+        # 缓存验证码结果和行为分析数据
         self._cached_captcha = None
         self._last_captcha_time = 0
+        self._cached_behavior_analysis = None
+        self._deptIdEnc = None
+        
+        # 请求频率限制
+        self._last_request_time = 0
+        self._request_count = 0
+        self._rate_limit_until = 0
 
     def get_target_date(self):
         """获取正确的目标预约日期（北京时间）"""
         now = datetime.datetime.now(self.beijing_tz)
-        # 根据reserve_next_day计算目标日期
         if self.reserve_next_day:
-            # 预约明天
             target_date = now + datetime.timedelta(days=1)
         else:
-            # 预约今天
-            target_date = now        
-
-    
+            target_date = now
         return target_date.strftime("%Y-%m-%d")
     
-    def _get_page_token(self, url):
-        """获取页面token，带重试机制和详细日志"""
+    def _respect_rate_limit(self):
+        """遵守请求频率限制"""
+        current_time = time.time()
+        
+        # 如果在频率限制期内，等待
+        if current_time < self._rate_limit_until:
+            wait_time = self._rate_limit_until - current_time
+            logging.info(f"频率限制中，等待 {wait_time:.2f} 秒")
+            time.sleep(wait_time)
+        
+        # 控制请求频率：每秒最多2个请求
+        time_since_last = current_time - self._last_request_time
+        if time_since_last < 0.5:
+            sleep_time = 0.5 - time_since_last
+            time.sleep(sleep_time)
+        
+        self._last_request_time = time.time()
+        self._request_count += 1
+    
+    def _get_page_token_and_data(self, url):
+        """获取页面token和相关数据，包括behaviorAnalysis和deptIdEnc"""
+        self._respect_rate_limit()
+        
         retry_count = 0
-        max_retries = 5  # 增加最大重试次数
+        max_retries = 3  # 减少重试次数，避免触发限制
         
         while retry_count < max_retries:
             try:
+                # 添加随机延迟，避免被检测
+                time.sleep(random.uniform(0.5, 1.5))
+                
                 response = self.requests.get(
                     url=url, 
                     verify=False, 
-                    timeout=15,  # 增加超时时间
+                    timeout=15,
                     headers={
                         "Referer": "https://office.chaoxing.com/",
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -103,71 +148,89 @@ class reserve:
                         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                         "Accept-Encoding": "gzip, deflate, br",
                         "Connection": "keep-alive",
-                        "Upgrade-Insecure-Requests": "1",
-                        "Sec-Fetch-Dest": "document",
-                        "Sec-Fetch-Mode": "navigate",
-                        "Sec-Fetch-Site": "same-origin",
-                        "Pragma": "no-cache",
-                        "Cache-Control": "no-cache"
+                        "Host": "office.chaoxing.com",
+                        "Cache-Control": "no-cache",
+                        "Pragma": "no-cache"
                     }
                 )
                 
-                # 记录HTTP状态码
-                logging.debug(f"获取token页面状态码: {response.status_code}")
-                
                 if response.status_code != 200:
-                    logging.warning(f"获取token失败，状态码: {response.status_code}，URL: {url}")
+                    logging.warning(f"获取页面失败，状态码: {response.status_code}")
                     retry_count += 1
-                    time.sleep(1.5)  # 增加等待时间
+                    time.sleep(2)  # 增加等待时间
                     continue
                     
                 html = response.text
                 
-                # 检查登录状态是否过期
+                # 检查登录状态
                 if "登录" in html and "请先登录" in html:
                     logging.error("会话已过期，需要重新登录")
-                    return "SESSION_EXPIRED"
+                    return "SESSION_EXPIRED", None, None
                 
-                # 尝试多种模式匹配token
+                # 提取token - 使用更多模式
                 token = None
                 for pattern in self.token_patterns:
                     token_match = pattern.search(html)
                     if token_match:
                         token = token_match.group(1)
+                        logging.debug(f"使用模式提取到token: {token[:10]}...")
                         break
                 
+                # 提取deptIdEnc - 使用多种模式
+                deptIdEnc = None
+                for pattern in self.dept_patterns:
+                    dept_match = pattern.search(html)
+                    if dept_match:
+                        deptIdEnc = dept_match.group(1)
+                        self._deptIdEnc = deptIdEnc
+                        logging.debug(f"提取到deptIdEnc: {deptIdEnc}")
+                        break
+                
+                # 如果没有找到，使用默认值（基于你的抓包数据）
+                if not deptIdEnc:
+                    deptIdEnc = "92329df6bdb2d3ec"
+                    self._deptIdEnc = deptIdEnc
+                    logging.info("使用默认deptIdEnc")
+                
+                # 提取或生成behaviorAnalysis
+                behavior_analysis = None
+                for pattern in self.behavior_patterns:
+                    behavior_match = pattern.search(html)
+                    if behavior_match:
+                        behavior_analysis = behavior_match.group(1)
+                        logging.debug("从页面提取到behaviorAnalysis数据")
+                        break
+                
+                if not behavior_analysis:
+                    behavior_analysis = generate_realistic_behavior_analysis()
+                    logging.debug("生成模拟behaviorAnalysis数据")
+                
+                self._cached_behavior_analysis = behavior_analysis
+                
                 if token:
-                    logging.debug(f"成功获取token: {token}")
-                    return token
+                    logging.debug(f"成功获取页面数据: token={token[:20]}...")
+                    return token, deptIdEnc, behavior_analysis
                 else:
-                    # 记录关键信息帮助调试
-                    logging.warning(f"未在页面中找到token，URL: {url}")
-                    # 提取页面标题用于调试
-                    title_match = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE)
-                    title = title_match.group(1) if title_match else "无标题"
-                    logging.warning(f"页面标题: {title}")
-                    
-                    # 保存页面内容用于调试（仅当DEBUG级别启用）
-                    if logging.getLogger().isEnabledFor(logging.DEBUG):
-                        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-                        filename = f"token_fail_{timestamp}.html"
-                        with open(filename, "w", encoding="utf-8") as f:
-                            f.write(html)
-                        logging.debug(f"保存页面内容到: {filename}")
-                    
-                    return ""
+                    logging.warning(f"未在页面中找到token")
+                    # 即使没有token也返回其他数据
+                    return "", deptIdEnc, behavior_analysis
                     
             except requests.exceptions.Timeout:
-                logging.warning(f"获取token超时，第 {retry_count+1} 次重试")
+                logging.warning(f"获取页面超时，第 {retry_count+1} 次重试")
                 retry_count += 1
-                time.sleep(1.5)
+                time.sleep(3)
             except Exception as e:
-                logging.error(f"获取token异常: {str(e)}")
+                logging.error(f"获取页面异常: {str(e)}")
                 retry_count += 1
-                time.sleep(1.5)
+                time.sleep(3)
         
-        logging.error(f"获取token失败，已达最大重试次数 {max_retries}")
-        return ""
+        logging.error(f"获取页面失败，已达最大重试次数")
+        return "", "92329df6bdb2d3ec", generate_realistic_behavior_analysis()
+
+    def _get_page_token(self, url):
+        """获取页面token（保持兼容性）"""
+        token, _, _ = self._get_page_token_and_data(url)
+        return token
 
     def get_login_status(self):
         """获取登录状态"""
@@ -305,16 +368,15 @@ class reserve:
             return ""
 
     def get_slide_captcha_data(self, roomid, seatid):
-        """获取滑块验证码数据 - 新版API"""
+        """获取滑块验证码数据"""
         url = "https://captcha.chaoxing.com/captcha/get/verification/image"
-    
-        # 使用更简单的参数结构
+        
         params = {
             "captchaId": "42sxgHoTPTKbt0uZxPJ7ssOvtXr3ZgZ1",
             "type": "slide",
             "version": "1.1.18"
         }
-    
+        
         try:
             response = self.requests.get(url, params=params, headers=self.headers)
             if response.status_code != 200:
@@ -322,8 +384,6 @@ class reserve:
                 return None, None, None
             
             data = response.json()
-        
-            # 新版API直接返回JSON
             captcha_token = data.get("token")
             image_vo = data.get("imageVerificationVo", {})
             bg = image_vo.get("shadeImage")
@@ -354,16 +414,7 @@ class reserve:
         c_captcha_headers = {
             "Referer": "https://office.chaoxing.com/",
             "Host": "captcha.chaoxing.com",
-            "Pragma" : 'no-cache',
-            "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
-            'Sec-Ch-Ua-Mobile':'?0',
-            'Sec-Ch-Ua-Platform':'"Linux"',
-            'Sec-Fetch-Dest':'document',
-            'Sec-Fetch-Mode':'navigate',
-            'Sec-Fetch-Site':'none',
-            'Sec-Fetch-User':'?1',
-            'Upgrade-Insecure-Requests':'1',
-            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         }
         
         try:
@@ -372,7 +423,7 @@ class reserve:
             tp_response = self.requests.get(tp, headers=c_captcha_headers, timeout=10)
             
             if bg_response.status_code != 200 or tp_response.status_code != 200:
-                logging.error(f"获取验证码图片失败: 背景图状态码={bg_response.status_code}, 滑块图状态码={tp_response.status_code}")
+                logging.error(f"获取验证码图片失败")
                 return None
                 
             bg_img = cv2.imdecode(np.frombuffer(bg_response.content, np.uint8), cv2.IMREAD_COLOR)
@@ -390,40 +441,34 @@ class reserve:
             res = cv2.matchTemplate(bg_pic, tp_pic, cv2.TM_CCOEFF_NORMED)
             _, _, _, max_loc = cv2.minMaxLoc(res)
             
-            # 返回x坐标
             return max_loc[0]
         except Exception as e:
             logging.error(f"计算滑块距离异常: {str(e)}")
             return None
 
     def submit(self, times, roomid, seatid, action):
-        """提交预约请求"""
-        # 时间格式化函数
+        """提交预约请求 - 适配新接口，增强错误处理"""
         def format_time(t):
             parts = t.split(':')
-            if len(parts) == 2:  # 只有小时和分钟
+            if len(parts) == 2:
                 return f"{t}:00"
             return t
         
-        # 格式化时间
         start_time = format_time(times[0])
         end_time = format_time(times[1])
         
         if not isinstance(seatid, list):
-            seatid = [seatid]  # 确保seatid是列表
+            seatid = [seatid]
         
         day_str = self.get_target_date()
         logging.info(f"预约日期: {day_str}, 时段: {start_time}-{end_time}")
         
-        # 并行处理每个座位
         def process_seat(seat):
-            # 每次尝试前创建独立的会话副本
             session_copy = self.copy_session()
-        
-            # 检查会话有效性 - 使用副本
+            
+            # 检查会话有效性
             if not session_copy.requests.cookies.get("JSESSIONID"):
                 logging.warning("会话已过期，尝试重新登录")
-                # 尝试重新登录
                 login_result = session_copy.login(session_copy.username, session_copy.password)
                 if not login_result[0]:
                     logging.error(f"重新登录失败: {login_result[1]}")
@@ -435,28 +480,33 @@ class reserve:
             logging.info(f"尝试预约座位: {seat}")
             suc = False
             attempt_count = 0
+            consecutive_rate_limit = 0  # 连续频率限制次数
             
             while not suc and attempt_count < self.max_attempt:
                 attempt_count += 1
                 logging.info(f"座位 {seat} 尝试 #{attempt_count}/{self.max_attempt}")
                 
-                # 获取token - 增强重试逻辑
-                token_retry = 0
-                token = ""
-                while token_retry < 5 and not token:
-                    token = session_copy._get_page_token(self.url.format(roomid, seat))
-                    if token == "SESSION_EXPIRED":
-                        logging.critical("会话过期，无法继续预约")
-                        return False
-                    if not token:
-                        logging.warning(f"获取token失败，重试中... ({token_retry+1}/5)")
-                        token_retry += 1
-                        time.sleep(1 + random.uniform(0, 1))  # 随机等待1-2秒
+                # 如果连续多次频率限制，增加等待时间
+                if consecutive_rate_limit >= 3:
+                    wait_time = 10 + consecutive_rate_limit * 5
+                    logging.warning(f"连续频率限制，等待 {wait_time} 秒")
+                    time.sleep(wait_time)
+                    consecutive_rate_limit = 0
                 
-                if not token:
-                    logging.error("无法获取有效token，跳过此座位")
-                    continue
+                # 获取完整页面数据
+                token, deptIdEnc, behavior_analysis = session_copy._get_page_token_and_data(
+                    self.url.format(roomid, seat)
+                )
+                
+                if token == "SESSION_EXPIRED":
+                    logging.critical("会话过期，无法继续预约")
+                    return False
                     
+                if not token:
+                    logging.warning("获取token失败，重试中...")
+                    time.sleep(2)
+                    continue
+                
                 # 处理验证码
                 captcha = ""
                 if self.enable_slider:
@@ -464,38 +514,64 @@ class reserve:
                     if not captcha:
                         logging.warning("验证码获取失败，使用空值继续尝试")
                 
-                # 准备请求参数
+                # 准备新版请求参数 - 严格按照抓包数据格式
                 parm = {
-                    "roomId": roomid,
-                    "startTime": start_time,  # 使用格式化后的时间
-                    "endTime": end_time,      # 使用格式化后的时间
+                    "deptIdEnc": deptIdEnc or "92329df6bdb2d3ec",
+                    "roomId": str(roomid),
+                    "startTime": start_time,
+                    "endTime": end_time, 
                     "day": day_str,
-                    "seatNum": seat,
-                    "captcha": captcha,
-                    "token": token
+                    "seatNum": str(seat).zfill(3),  # 确保3位数格式
+                    "captcha": f"validate_{captcha}" if captcha else "validate_42sxgHoTPTKbt0uZxPJ7ssOvtXr3ZgZ1_00AFBBC0026AEDCD6E46B46399C229E9",
+                    "token": token,
+                    "behaviorAnalysis": behavior_analysis or session_copy._cached_behavior_analysis
                 }
                 
                 # 生成加密签名
                 parm["enc"] = enc(parm)
                 
+                # 遵守频率限制
+                session_copy._respect_rate_limit()
+                
                 try:
+                    # 使用精确的请求头（基于抓包数据）
+                    headers = {
+                        "Host": "office.chaoxing.com",
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "Accept": "application/json, text/javascript, */*; q=0.01",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                        "Origin": "https://office.chaoxing.com",
+                        "Referer": f"https://office.chaoxing.com/front/third/apps/seat/code?id={roomid}&seatNum={seat}",
+                        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "Connection": "keep-alive",
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "same-origin"
+                    }
+                    
+                    # 记录请求参数用于调试
+                    logging.debug(f"请求参数: deptIdEnc={parm['deptIdEnc']}, roomId={parm['roomId']}, seatNum={parm['seatNum']}")
+                    
                     response = session_copy.requests.post(
                         url=self.submit_url, 
                         data=parm, 
                         verify=True,
                         timeout=15,
-                        headers={
-                            "Referer": f"https://office.chaoxing.com/front/third/apps/seat/code?id={roomid}&seatNum={seat}",
-                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                            "X-Requested-With": "XMLHttpRequest"
-                        }
+                        headers=headers
                     )
                     
                     if response.status_code != 200:
                         logging.warning(f"预约请求失败，状态码: {response.status_code}")
-                        # 记录响应内容以便调试
                         logging.debug(f"响应内容: {response.text[:500]}")
-                        time.sleep(self.sleep_time)
+                        
+                        if response.status_code == 429:  # Too Many Requests
+                            consecutive_rate_limit += 1
+                            session_copy._rate_limit_until = time.time() + 30
+                            logging.warning("触发HTTP 429限制")
+                        
+                        time.sleep(self.sleep_time * 2)
                         continue
                     
                     try:
@@ -510,30 +586,57 @@ class reserve:
                     if result.get("success", False):
                         logging.info(f"座位 {seat} 预约成功!")
                         suc = True
+                        consecutive_rate_limit = 0  # 重置计数器
                     else:
                         msg = result.get("msg", "未知错误")
                         logging.warning(f"预约失败: {msg}")
                         
-                        # 特定错误处理
+                        # 增强的错误处理
                         if "未在系统中开放" in msg:
                             logging.error("时段未开放，停止尝试")
                             break
                             
-                        if "当前人数过多" in msg:
-                            logging.warning("系统繁忙，稍后重试")
-                            time.sleep(0.5)
-                except Exception as e:
+                        elif "当前使用人数较多" in msg or "请5分钟后再次尝试" in msg:
+                            consecutive_rate_limit += 1
+                            # 动态调整等待时间
+                            wait_time = min(30, 5 + consecutive_rate_limit * 2)
+                            logging.warning(f"系统繁忙，等待 {wait_time} 秒后重试")
+                            time.sleep(wait_time)
+                            
+                            # 更新频率限制时间
+                            session_copy._rate_limit_until = time.time() + wait_time
+                            
+                        elif "座位已被预约" in msg:
+                            logging.warning("座位已被占用，尝试下一个")
+                            break
+                            
+                        elif "token" in msg.lower() or "验证" in msg:
+                            logging.warning("token或验证问题，重新获取")
+                            # 清除缓存，强制重新获取
+                            session_copy.token = ""
+                            session_copy._cached_behavior_analysis = None
+                            time.sleep(1)
+                            
+                        else:
+                            # 其他未知错误，短暂等待
+                            time.sleep(self.sleep_time)
+                            
+                except requests.exceptions.Timeout:
+                    logging.warning("请求超时，重试中...")
+                    time.sleep(2)
+                except requests.exceptions.RequestException as e:
                     logging.error(f"请求异常: {str(e)}")
-                
-                time.sleep(self.sleep_time)
+                    time.sleep(2)
+                except Exception as e:
+                    logging.error(f"预约过程异常: {str(e)}")
+                    time.sleep(2)
             
             if not suc:
                 logging.warning(f"座位 {seat} 预约失败，已达最大尝试次数")
             return suc
         
-
         # 使用线程池并行处理每个座位
-        with ThreadPoolExecutor(max_workers=len(seatid)) as executor:
+        with ThreadPoolExecutor(max_workers=min(len(seatid), 3)) as executor:  # 限制并发数
             futures = [executor.submit(process_seat, seat) for seat in seatid]
             results = [future.result() for future in futures]
         
@@ -560,5 +663,16 @@ class reserve:
     
         # 复制headers
         new_session.requests.headers = self.requests.headers.copy()
+        
+        # 复制缓存数据
+        new_session._cached_behavior_analysis = self._cached_behavior_analysis
+        new_session._deptIdEnc = self._deptIdEnc
+        new_session._cached_captcha = self._cached_captcha
+        new_session._last_captcha_time = self._last_captcha_time
+        
+        # 复制频率限制状态
+        new_session._last_request_time = self._last_request_time
+        new_session._request_count = self._request_count
+        new_session._rate_limit_until = self._rate_limit_until
     
         return new_session
